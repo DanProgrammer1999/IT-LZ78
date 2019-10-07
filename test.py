@@ -1,20 +1,39 @@
 import os
 import lz
 import time
+from multiprocessing import Process, Pool
+import threading
+
+global_lock = threading.Lock()
 
 
 class Parameters:
     root_path = os.getcwd()
 
     source_dest = 'dataset'
-    compressed_dest = 'generated{}compressed'.format(os.sep)
-    decompressed_dest = 'generated{}decompressed'.format(os.sep)
+    output_dest = 'DaniilDvoryanovOutputs'
 
     log_file = 'log.txt'
     log_fd = None
 
     verbose = False
     validate = False
+
+
+class ProcessData:
+    ratios = []
+    failed_count = 0
+
+    @staticmethod
+    def set(*args):
+        ratio, failed = args[0]
+        ProcessData.ratios.append(ratio)
+        ProcessData.failed_count += failed
+
+    @staticmethod
+    def reset():
+        ProcessData.ratios = []
+        ProcessData.failed_count = 0
 
 
 def timed_function(f, *args, **kwargs):
@@ -26,17 +45,21 @@ def timed_function(f, *args, **kwargs):
 
 
 def log(*data, sep=' ', end='\n', stdout=False, close=False):
+    global_lock.acquire()
     if not Parameters.log_fd:
         Parameters.log_fd = open(Parameters.log_file, 'w')
 
     Parameters.log_fd.write(sep.join(data) + end)
-    if stdout:
-        print(*data, sep=sep, end=end)
 
     if close:
         Parameters.log_fd.flush()
         Parameters.log_fd.close()
         Parameters.log_fd = None
+
+    global_lock.release()
+
+    if stdout:
+        print(*data, sep=sep, end=end)
 
 
 def get_compression_ratio(original, compressed):
@@ -48,75 +71,67 @@ def test_file(path, filename):
     name, extensions = filename.split('.', 1)
 
     source_path = os.path.join(path, filename)
-    compressed_path = os.path.join(Parameters.root_path, Parameters.compressed_dest, dirname, name + ".comp")
-    decompressed_path = os.path.join(Parameters.root_path, Parameters.decompressed_dest, dirname,
-                                     name + ".decomp." + extensions)
+    compressed_path = os.path.join(Parameters.root_path, Parameters.output_dest, dirname,
+                                   name + "Compressed." + extensions)
+    decompressed_path = os.path.join(Parameters.root_path, Parameters.output_dest, dirname,
+                                     name + "Decompressed." + extensions)
 
-    total_time = 0
-
-    log("Compressing file {}".format(os.path.join(dirname, filename)), stdout=Parameters.verbose)
-    _, time = timed_function(lz.compress, source_path, compressed_path)
-    total_time += time
+    lz.compress(source_path, compressed_path)
     ratio = get_compression_ratio(source_path, compressed_path)
-    log("Compressed in {}s with compression ratio ".format(time, ratio), stdout=Parameters.verbose)
+    log("Compressed {} with compression ratio ".format(filename, ratio), stdout=Parameters.verbose)
 
-    log("Decompressing file {}".format(os.path.join(dirname, name) + ".comp"), stdout=Parameters.verbose)
-    _, time = timed_function(lz.decompress, compressed_path, decompressed_path)
-    total_time += time
-    log("Decompressed in {}s".format(time), stdout=Parameters.verbose)
+    lz.decompress(compressed_path, decompressed_path)
+    log("Decompressed {}".format(filename), stdout=Parameters.verbose)
 
     is_valid = None
 
     if Parameters.validate:
 
         is_valid, time = timed_function(lz.compare_files, source_path, decompressed_path)
-        total_time += time
         if is_valid:
             log("Validation of file {} passed in {}s".format(os.path.join(dirname, filename), time),
                 stdout=Parameters.verbose)
         else:
             log("Validation of file {} FAILED in {}s".format(os.path.join(dirname, filename), time), stdout=True)
 
-    return total_time, ratio, 1 if is_valid else 0
+    # ProcessData.ratios.append(ratio)
+    # ProcessData.time += total_time
+    # ProcessData.failed_count += 1 if is_valid else 0
+
+    return ratio, 1 if is_valid else 0
 
 
 def test_folder(dirname, files):
     log("Testing folder {}\n".format(dirname), stdout=Parameters.verbose)
 
-    compressed_path = os.path.join(Parameters.root_path, Parameters.compressed_dest, dirname)
-    decompressed_path = os.path.join(Parameters.root_path, Parameters.decompressed_dest, dirname)
+    source_path = os.path.join(Parameters.root_path, Parameters.source_dest, dirname)
+    output_path = os.path.join(Parameters.root_path, Parameters.output_dest, dirname)
 
-    if not os.path.exists(compressed_path):
-        os.makedirs(compressed_path)
-    if not os.path.exists(decompressed_path):
-        os.makedirs(decompressed_path)
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
 
-    ratios = []
-    failed_count = 0
-    total_time = 0
+    pool = Pool(os.cpu_count())
+    processes = []
 
     for file in files:
-        time, ratio, failed = test_file(os.path.join(Parameters.root_path, Parameters.source_dest, dirname), file)
-        total_time += time
-        ratios.append(ratio)
-        if failed:
-            failed_count += failed
+        # time, ratio, failed = test_file(source_path, file)
+        p = pool.apply_async(func=test_file, args=(source_path, file), callback=ProcessData.set)
+        processes.append(p)
 
         log("", stdout=Parameters.verbose)
 
-    if len(ratios) > 0:
-        avg_ratio = sum(ratios) / len(ratios)
+    pool.close()
+    pool.join()
+
+    if len(ProcessData.ratios) > 0:
+        avg_ratio = sum(ProcessData.ratios) / len(ProcessData.ratios)
     else:
         avg_ratio = 0
+    failed_count = ProcessData.failed_count
 
-    report = "{} finished testing. Average ratio: {}, time elapsed: {}s"
-    if Parameters.validate:
-        report += ", failed {} files"
+    ProcessData.reset()
 
-    report += "\n" + "-" * 30
-    log(report.format(dirname, avg_ratio, total_time, failed_count), stdout=True)
-
-    return total_time, avg_ratio, failed_count
+    return avg_ratio, failed_count
 
 
 def test():
@@ -127,21 +142,29 @@ def test():
     for dirpath, dirnames, filenames in os.walk(os.path.join(os.getcwd(), Parameters.source_dest)):
         dirname = dirpath.split(os.sep)[-1]
         if filenames:
-            time, ratio, failed = test_folder(dirname, filenames)
+            res, time = timed_function(test_folder, dirname, filenames)
+            ratio, failed = res
             total_time += time
             ratios.append(ratio)
             failed_count += failed
+
+            report = "{} finished testing. Average ratio: {}, time elapsed: {}s"
+            if Parameters.validate:
+                report += ", failed {} files"
+
+            report += "\n" + "-" * 30
+            log(report.format(dirname, ratio, time, failed_count), stdout=True)
 
     if len(ratios) > 0:
         avg_ratio = sum(ratios) / len(ratios)
     else:
         avg_ratio = 0
 
-    report = "-" * 30 + "\nFinished testing. Average overall ratio: {}, total time elapsed: {} (~{}min)"
+    report = "-" * 30 + "\nFinished testing. Average overall ratio: {}, total time elapsed: {}s (~{}min)"
     if Parameters.validate:
         report += ", failed {} files"
 
-    log(report.format(avg_ratio, total_time, failed_count, total_time/60), stdout=True, close=True)
+    log(report.format(avg_ratio, total_time, total_time / 60, failed_count), stdout=True, close=True)
 
 
 if __name__ == '__main__':
